@@ -19,6 +19,7 @@ package com.android.settings.network.telephony.scan
 import android.content.Context
 import android.telephony.AccessNetworkConstants.AccessNetworkType
 import android.telephony.CellInfo
+import android.telephony.CarrierConfigManager
 import android.telephony.CellInfoGsm
 import android.telephony.CellInfoLte
 import android.telephony.CellInfoWcdma
@@ -38,6 +39,7 @@ import com.android.settings.network.telephony.CellInfoUtil.toCellInfo
 import com.android.settings.network.telephony.telephonyManager
 import com.android.settingslib.spa.framework.util.collectLatestWithLifecycle
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -46,7 +48,7 @@ import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.onEach
 
-class NetworkScanRepository(private val context: Context, subId: Int) {
+class NetworkScanRepository(private val context: Context, private val subId: Int) {
     enum class NetworkScanState {
         ACTIVE, COMPLETE, ERROR
     }
@@ -77,71 +79,113 @@ class NetworkScanRepository(private val context: Context, subId: Int) {
     fun networkScanFlow(): Flow<NetworkScanResult> = callbackFlow {
         var state = NetworkScanState.ACTIVE
         var cellInfos: List<CellInfo> = emptyList()
+        val active = AtomicBoolean(true)
+        // Keep callbacks serialized and release the worker when this collection ends.
+        val executor = Executors.newSingleThreadExecutor()
+
+        fun sendResult() {
+            if (active.get()) trySend(NetworkScanResult(state, cellInfos))
+        }
+
+        fun finishWithVisibleCells() {
+            if (!active.get()) return
+            val fallbackCells = getFallbackCellInfos()
+            if (!active.get()) return
+            if (fallbackCells.isNotEmpty() && cellInfos.isEmpty()) {
+                cellInfos = fallbackCells.distinctBy { CellInfoScanKey(it) }
+                state = NetworkScanState.COMPLETE
+            } else {
+                state = NetworkScanState.ERROR
+            }
+            sendResult()
+            active.set(false)
+            close()
+        }
 
         val callback = object : TelephonyScanManager.NetworkScanCallback() {
             override fun onResults(results: List<CellInfo>) {
+                if (!active.get()) return
                 cellInfos = results.distinctBy { CellInfoScanKey(it) }
                 sendResult()
             }
 
             override fun onComplete() {
+                if (!active.get()) return
                 state = NetworkScanState.COMPLETE
                 sendResult()
-                // Don't call close() here since onComplete() could happens before onResults()
+                // Some modems deliver their final onResults() after onComplete().
             }
 
             override fun onError(error: Int) {
+                if (!active.get()) return
                 if (error == NetworkScan.ERROR_UNSUPPORTED) {
                     Log.d(TAG, "network scan unsupported, falling back to legacy query")
                     queryAvailableNetworks()
-                    return
+                } else {
+                    Log.w(TAG, "network scan onError: $error, falling back to visible cells")
+                    finishWithVisibleCells()
                 }
-                state = NetworkScanState.ERROR
-                sendResult()
-                close()
             }
 
             private fun queryAvailableNetworks() {
-                val result = telephonyManager.getAvailableNetworks()
-                if (result.status == CellNetworkScanResult.STATUS_SUCCESS) {
-                    // The legacy query lists every PLMN once per RAT,
-                    // keep the registered or best one
-                    cellInfos = result.operators.orEmpty()
-                        .mapNotNull { it.toCellInfo() }
-                        .groupBy { it.cellIdentity.getOperatorNumeric() }
-                        .values
-                        .map { infos ->
-                            infos.maxWith(compareBy<CellInfo>(
-                                { it.isRegistered },
-                                { LEGACY_RAT_ORDER.indexOf(it.javaClass) },
-                            ))
-                        }
-                    state = NetworkScanState.COMPLETE
-                } else {
-                    state = NetworkScanState.ERROR
+                val result = try {
+                    telephonyManager.getAvailableNetworks()
+                } catch (e: RuntimeException) {
+                    Log.w(TAG, "legacy network query failed", e)
+                    finishWithVisibleCells()
+                    return
                 }
+                // The blocking Binder query has no cancellation API. Drop its response
+                // when the lifecycle has already ended this collection.
+                if (!active.get()) return
+                if (result?.status != CellNetworkScanResult.STATUS_SUCCESS) {
+                    finishWithVisibleCells()
+                    return
+                }
+                cellInfos = result.operators.orEmpty()
+                    .mapNotNull { it.toCellInfo() }
+                    .groupBy { it.cellIdentity.getOperatorNumeric() }
+                    .values
+                    .map { infos ->
+                        infos.maxWith(compareBy<CellInfo>(
+                            { it.isRegistered },
+                            { LEGACY_RAT_ORDER.indexOf(it.javaClass) },
+                        ))
+                    }
+                state = NetworkScanState.COMPLETE
                 sendResult()
+                active.set(false)
                 close()
-            }
-
-            private fun sendResult() {
-                trySend(NetworkScanResult(state, cellInfos))
             }
         }
 
-        val networkScan = telephonyManager.requestNetworkScan(
-            createNetworkScan(),
-            // requestNetworkScan() could call callbacks concurrently, so we use a single thread
-            // to avoid racing conditions.
-            Executors.newSingleThreadExecutor(),
-            callback,
-        )
+        val networkScan = try {
+            telephonyManager.requestNetworkScan(createNetworkScan(), executor, callback)
+                .also { if (it == null) finishWithVisibleCells() }
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "requestNetworkScan failed to start", e)
+            finishWithVisibleCells()
+            null
+        }
 
         awaitClose {
-            networkScan.stopScan()
+            active.set(false)
+            try {
+                networkScan?.stopScan()
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "network scan stopScan failed", e)
+            } finally {
+                executor.shutdownNow()
+            }
             Log.d(TAG, "network scan stopped")
         }
     }.conflate().onEach { Log.d(TAG, "networkScanFlow: $it") }.flowOn(Dispatchers.Default)
+
+    private fun getFallbackCellInfos(): List<CellInfo> = runCatching {
+        telephonyManager.allCellInfo?.filter {
+            it.cellIdentity.getNetworkTitle() != null
+        } ?: emptyList()
+    }.getOrDefault(emptyList())
 
     /** Create network scan for allowed network types. */
     private fun createNetworkScan(): NetworkScanRequest {
@@ -150,12 +194,17 @@ class NetworkScanRepository(private val context: Context, subId: Int) {
         val radioAccessSpecifiers = allowedNetworkTypes
             .map { RadioAccessSpecifier(it, null, null) }
             .toTypedArray()
+        val isIncremental = runCatching {
+            val carrierConfigManager = context.getSystemService(CarrierConfigManager::class.java)
+            carrierConfigManager?.getConfigForSubId(subId)
+                ?.getBoolean("incremental_network_scan_supported_bool", false)
+        }.getOrNull() ?: false
         return NetworkScanRequest(
             NetworkScanRequest.SCAN_TYPE_ONE_SHOT,
             radioAccessSpecifiers,
             NetworkScanRequest.MIN_SEARCH_PERIODICITY_SEC, // one shot, not used
             context.resources.getInteger(R.integer.config_network_scan_helper_max_search_time_sec),
-            true,
+            isIncremental,
             INCREMENTAL_RESULTS_PERIODICITY_SEC,
             null,
         )
