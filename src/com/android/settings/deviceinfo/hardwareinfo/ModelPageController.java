@@ -191,7 +191,7 @@ public class ModelPageController extends BasePreferenceController {
 
     private boolean isOfficialBuild() {
         return "Official".equalsIgnoreCase(
-                SystemProperties.get("ro.evolution.build.type", ""));
+                org.evolution.build.BuildType.VALUE);
     }
 
     // -------------------------------------------------------------------------
@@ -200,7 +200,7 @@ public class ModelPageController extends BasePreferenceController {
 
     @Override
     public int getAvailabilityStatus() {
-        String evoDevice = SystemProperties.get("ro.evolution.device", "");
+        String evoDevice = org.evolution.build.Device.VALUE;
         if (!evoDevice.isEmpty()) return AVAILABLE;
         return SystemProperties.get("ro.product.device", "").isEmpty()
                 ? UNSUPPORTED_ON_DEVICE : AVAILABLE;
@@ -649,7 +649,7 @@ public class ModelPageController extends BasePreferenceController {
     }
 
     private String getCodename() {
-        String c = SystemProperties.get("ro.evolution.device", "");
+        String c = org.evolution.build.Device.VALUE;
         return c.isEmpty() ? SystemProperties.get("ro.product.device", "") : c;
     }
 
@@ -1456,7 +1456,7 @@ public class ModelPageController extends BasePreferenceController {
 
     private Set<String> getCodenameCandidates(String primary) {
         Set<String> result = new LinkedHashSet<>();
-        addIfNotEmpty(result, SystemProperties.get("ro.evolution.device", null));
+        addIfNotEmpty(result, org.evolution.build.Device.VALUE);
         addIfNotEmpty(result, primary);
         addIfNotEmpty(result, SystemProperties.get("ro.product.vendor.device", null));
         addIfNotEmpty(result, SystemProperties.get("ro.build.product", null));
