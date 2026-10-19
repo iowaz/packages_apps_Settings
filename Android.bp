@@ -58,6 +58,8 @@ android_library {
         "src/**/*.aidl",
         "Evolver/src/**/*.java",
         "Evolver/src/**/*.kt",
+        ":evolution-build-info-build-type",
+        ":evolution-build-info-device",
     ],
     exclude_srcs: [
         "src/com/android/settings/biometrics/fingerprint2/lib/**/*.kt",
